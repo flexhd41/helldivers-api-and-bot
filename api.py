@@ -85,6 +85,16 @@ def update_liberation_percentages():
 def get_liberation_percentage():
     return jsonify({'planets_liberation_percentages': planet_liberation_percentages})
 
+@api.route('/global_events', methods=['GET'])
+def get_global_events():
+    response = requests.get('https://helldivers-2.fly.dev/api/801/status')
+    if response.status_code == 200:
+        data = response.json()
+        global_events = data.get('global_events', [])  # Extract the global events information
+        return jsonify(global_events), 200
+    else:
+        return jsonify({"error": "Unable to fetch data"}), 500
+
 if __name__ == '__main__':
     # Start the background thread to update the liberation percentages
     scheduler.add_job(id='update_liberation_percentages', func=update_liberation_percentages, trigger='interval', seconds=35)
