@@ -9,6 +9,11 @@ from typing import Union
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 intents = discord.Intents.default()
@@ -215,4 +220,4 @@ async def galactic_war_info(ctx: discord.ApplicationContext, channel: Union[disc
     await ctx.respond(f"Added Galactic War Status to channel {channel.mention}", ephemeral=True)
 
 
-bot.run('OTAxMDk2NzQ0NzUyOTM0OTIy.GPi1Bg.cre87TKdj5IioBNmZ9z9zo0OIa5PZoujgB1Vak')
+bot.run(os.getenv('DISCORD_BOT_TOKEN'))
