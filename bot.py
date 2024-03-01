@@ -6,7 +6,10 @@ from bs4 import BeautifulSoup
 import datetime
 import sqlite3
 from typing import Union
-from table2ascii import table2ascii as t2a, PresetStyle
+import matplotlib.pyplot as plt
+import numpy as np
+from datetime import datetime
+
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -21,6 +24,14 @@ def setup_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             channel INTEGER NOT NULL,
             message_id INTEGER
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS historical_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            planet TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            net_force REAL NOT NULL
         )
     ''')
     conn.commit()
@@ -58,7 +69,7 @@ async def on_ready():
 async def update_hell_divers_info():
     await bot.wait_until_ready()
     # Fetch the latest Hell Divers data
-    data = requests.get('http://127.0.0.1:5000/scrape').json()
+    data = requests.get('http://82.165.212.88:3000/activePlanets').json()
 
     # Get the channels to update
     channels_to_update = get_channels_to_update(conn)  # Pass the connection object
@@ -84,33 +95,57 @@ def store_message_id(conn, channel_id, message_id):
     cursor.execute('UPDATE servers SET message_id = ? WHERE channel = ?', (message_id, channel_id))
     conn.commit()
 
-from table2ascii import table2ascii as t2a, PresetStyle
+import discord
 
-from discord import Embed, Colour
 
 def create_embed(data):
-    # Create a new Discord embed
-    embed = Embed(title="Hell Divers Data", description="Current status", color=Colour.green())
-    now = datetime.datetime.now()
-    embed.set_footer(text=f'Last updated • Today at {now.strftime("%H:%M")} (UTC+00)')
-
-    # Add each item from the data as a field in the embed
+    # Create a new embed object
+    embed = discord.Embed(title="Galactic War Status", description="Current status of planets", color=0x00ff00)
+    
+    # Set the timestamp for the last update
+    embed.timestamp = datetime.utcnow()
+    
+    # Iterate over each item in the data
     for item in data:
-        # Format the field name and value
-        field_name = f"{item['defending']} - {item['percentage']}"
-        field_value = f"Players: {item['count']}\nStatus: {item['status']}"
-
-        # Add the field to the embed
-        embed.add_field(name=field_name, value=field_value, inline=False)
-        now = datetime.datetime.now() # Gets your current time as a datetime object
-
-
+        if item['forces']['net'] is not None:
+            net_force_cleaned = item['forces']['net'].replace('%/hr', '')
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO historical_data (planet, net_force) VALUES (?, ?)', (item['planet'], net_force_cleaned))
+            conn.commit()
+        else:
+            print(f"Skipping insertion for planet {item['planet']} due to missing 'net_force' value.")
+        # Determine the color and emoji based on the status
+        if "LOSING GROUND" in item['status']:
+            embed.color = discord.Color.red()
+        elif "LIBERATING" in item['status']:
+            embed.color = discord.Color.green()
+        else:
+            embed.color = discord.Color.blue()
+        if "(" in item['planet']:
+            planet_name = "🛡️" + item['planet']
+        else:
+            planet_name = "⚔️" + item['planet']
+            
+        
+        # Combine all relevant information into a single field
+        value = f"Liberation: {item['liberation']}\nPlayers: {item['players']}\nStatus: {item['status']}\nSuper Earth Forces: {item['forces']['super_earth_forces']}\nEnemy Forces: {item['forces']['enemy_forces']}\nNet: {item['forces']['net']}"
+        
+        # Add a field for each planet with the combined information
+        embed.add_field(name=planet_name, value=value, inline=False)
+    
     return embed
+
+
+
+
+
+
+
 
 
 @bot.slash_command()
 async def send_data(ctx):
-    response = requests.get('http://127.0.0.1:5000/scrape')
+    response = requests.get('http://82.165.212.88:3000/activePlanets')
     data = response.json()
 
     embed = discord.Embed(title="Hell Divers Data", description="Current status", color=0x00ff00)
@@ -121,6 +156,54 @@ async def send_data(ctx):
 
 update_hell_divers_info.start()
 
+
+import matplotlib.dates as mdates
+
+@bot.slash_command()
+@option(
+    "planet",
+    description="Select a planet",
+    choices=["PÖPLI IX", "VELD", "INGMAR", "DRAUPNIR", "MALEVELON CREEK", "Other Planets**"]
+)
+async def send_graph(ctx, planet: str):
+    # Fetch historical data for the selected planet
+    cursor = conn.cursor()
+    cursor.execute('SELECT timestamp, net_force FROM historical_data WHERE planet = ? ORDER BY timestamp DESC LIMIT 100', (planet,))
+    rows = cursor.fetchall()
+
+    if len(rows) < 2:
+        await ctx.respond("Not enough historical data available.")
+        return
+
+    # Convert the strings to datetime objects and net_force to float
+    timestamps = [datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S") for row in rows]
+    net_forces = [float(row[1]) for row in rows]
+
+    # Create a figure and a set of subplots
+    fig, ax = plt.subplots()
+
+    # Plot the net force over time
+    ax.plot(timestamps, net_forces, marker='o', label='Net Force')
+
+    # Set labels and title
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Net Force (%/Hr)')
+    ax.set_title(f'Net Force Trend for {planet}')
+    ax.legend()
+
+    # Format x-axis to display every 5 minutes
+    ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=5))  # to get a tick every 5 minutes
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # hours and minutes
+
+    # Save the figure as an image file
+    plt.savefig('net_force_graph.png')
+
+    # Send the image with your bot
+    with open('net_force_graph.png', 'rb') as f:
+        picture = discord.File(f, filename='net_force_graph.png')
+    await ctx.respond(file=picture)
+
+
 @bot.slash_command()
 @option(
     "channel",
@@ -129,8 +212,7 @@ update_hell_divers_info.start()
 )
 async def galactic_war_info(ctx: discord.ApplicationContext, channel: Union[discord.TextChannel]):
     add_server(conn, channel.id)
-    await ctx.defer()
-    await ctx.followup.send(f"Added Galactic War Status to channel {channel.mention}", ephemeral=True)
+    await ctx.respond(f"Added Galactic War Status to channel {channel.mention}", ephemeral=True)
 
 
-bot.run('TOKEN')
+bot.run('OTAxMDk2NzQ0NzUyOTM0OTIy.GPi1Bg.cre87TKdj5IioBNmZ9z9zo0OIa5PZoujgB1Vak')
