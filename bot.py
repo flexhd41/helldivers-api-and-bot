@@ -19,7 +19,13 @@ load_dotenv()
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-
+def delete_old_data(conn):
+    cursor = conn.cursor()
+    cursor.execute('''
+        DELETE FROM historical_data
+        WHERE timestamp < datetime('now', '-1 hour')
+    ''')
+    conn.commit()
 # Setup SQLite database
 def setup_db():
     conn = sqlite3.connect('servers.db')
@@ -70,11 +76,23 @@ async def on_ready():
     print(f'We have logged in as {bot.user}')
 
 
+latest_data = None
+
+@tasks.loop(seconds=30)
+async def fetch_hell_divers_info():
+    global latest_data
+    latest_data = requests.get('http://82.165.212.88:3000/activePlanets').json()
+    await bot.wait_until_ready()
+    delete_old_data(conn)
+    
+    # Fetch the latest Hell Divers data
+    
+
 @tasks.loop(seconds=60)
 async def update_hell_divers_info():
     await bot.wait_until_ready()
     # Fetch the latest Hell Divers data
-    data = requests.get('http://82.165.212.88:3000/activePlanets').json()
+    data = latest_data
 
     # Get the channels to update
     channels_to_update = get_channels_to_update(conn)  # Pass the connection object
@@ -160,6 +178,7 @@ async def send_data(ctx):
     await ctx.respond(embed=embed)
 
 update_hell_divers_info.start()
+fetch_hell_divers_info.start()
 
 
 import matplotlib.dates as mdates
@@ -193,7 +212,7 @@ async def send_graph(ctx, planet: str):
     # Set labels and title
     ax.set_xlabel('Time')
     ax.set_ylabel('Net Force (%/Hr)')
-    ax.set_title(f'Net Force Trend for {planet}')
+    ax.set_title(f'Net Force Trend for {planet} Per hour')
     ax.legend()
 
     # Format x-axis to display every 5 minutes
