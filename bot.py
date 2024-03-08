@@ -332,7 +332,7 @@ async def gen_map_wip(ctx):
     await ctx.response.defer()
 
     # Senden Sie eine GET-Anfrage an die URL
-    response = requests.get('https://helldivers-2.fly.dev/api/801/planets')
+    response = requests.get('http://api.nexusrealms.de:4000/api/801/planets')
 
     # Überprüfen Sie, ob die Anfrage erfolgreich war
     if response.status_code == 200:
