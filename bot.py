@@ -11,6 +11,7 @@ import numpy as np
 from datetime import datetime
 import os
 from dotenv import load_dotenv
+import json
 
 # Load environment variables from .env file
 load_dotenv()
@@ -18,6 +19,8 @@ load_dotenv()
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+
 
 def delete_old_data(conn):
     cursor = conn.cursor()
@@ -55,6 +58,20 @@ def store_message_id(conn, channel_id, message_id):
     cursor.execute('UPDATE servers SET message_id = ? WHERE channel = ?', (message_id, channel_id))
     conn.commit()
 
+def cleanup():
+    cursor = conn.cursor()
+    servers = cursor.fetchall()
+    for channel_id in servers:
+        channel_id = channel_id[0]  # fetchall() returns a list of tuples
+        try:
+            channel = bot.get_channel(int(channel_id))
+            if channel is None:
+                raise Exception('403 Forbidden')
+        except Exception as e:
+            if '403 Forbidden' in str(e):
+                cursor.execute("DELETE FROM servers WHERE channel_id = ?", (channel_id,))
+                conn.commit()
+
 def get_channels_to_update(conn):
     cursor = conn.cursor()
     cursor.execute('SELECT channel, message_id FROM servers')
@@ -83,28 +100,29 @@ net_force_cleaned = None
 async def fetch_hell_divers_info():
     global latest_data
     
-    latest_data = requests.get('http://82.165.212.88:3000/activePlanets').json()
+    latest_data = requests.get('http://dev.nexusrealms.de:25567/api/planet-data').json()
     await bot.wait_until_ready()
-    #delete_old_data(conn)
+    cleanup()
     for item in latest_data:
         if item['liberation'] is not None:
             global net_force_cleaned
             net_force_cleaned = item['liberation'].replace('%', '')
             cursor = conn.cursor()
-            cursor.execute('INSERT INTO historical_data (planet, net_force) VALUES (?, ?)', (item['planet'], net_force_cleaned))
+            # Get the current timestamp in the desired format
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('INSERT INTO historical_data (planet, net_force, timestamp) VALUES (?, ?, ?)', (item['name'], net_force_cleaned, timestamp))
             conn.commit()
         else:
-            print(f"Skipping insertion for planet {item['planet']} due to missing 'net_force' value.")
-        # Determine the color and emoji based on the status
-    
-    # Fetch the latest Hell Divers data
+            print(f"Skipping insertion for planet {item['name']} due to missing 'liberation' value.")
     
 
 @tasks.loop(seconds=60)
 async def update_hell_divers_info():
+    cleanup()
     await bot.wait_until_ready()
+    
     # Fetch the latest Hell Divers data
-    data = latest_data
+    data = latest_data  # Use the data directly
 
     # Get the channels to update
     channels_to_update = get_channels_to_update(conn)  # Pass the connection object
@@ -123,46 +141,21 @@ async def update_hell_divers_info():
             # Store the new message ID for future updates
             store_message_id(conn, channel_id, message.id)  # Pass the connection object
 
-
-
 def store_message_id(conn, channel_id, message_id):
     cursor = conn.cursor()
     cursor.execute('UPDATE servers SET message_id = ? WHERE channel = ?', (message_id, channel_id))
     conn.commit()
 
-import discord
-
-
 def create_embed(data):
-    # Create a new embed object
     embed = discord.Embed(title="Galactic War Status", description="Current status of planets", color=0x00ff00)
-    
-    # Set the timestamp for the last update
     embed.timestamp = datetime.utcnow()
-    
-    # Iterate over each item in the data
-    for item in data:
-        # Determine the color and emoji based on the status
-        if "LOSING GROUND" in item['status']:
-            embed.color = discord.Color.red()
-        elif "LIBERATING" in item['status']:
-            embed.color = discord.Color.green()
-        else:
-            embed.color = discord.Color.blue()
-        if "(" in item['planet']:
-            planet_name = "🛡️" + item['planet']
-        else:
-            planet_name = "⚔️" + item['planet']
-            
-        
-        # Combine all relevant information into a single field
-        value = f"Liberation: {item['liberation']}\nPlayers: {item['players']}\nStatus: {item['status']}\nSuper Earth Forces: {item['forces']['super_earth_forces']}\nEnemy Forces: {item['forces']['enemy_forces']}\nNet: {item['forces']['net']}"
-        
-        # Add a field for each planet with the combined information
-        embed.add_field(name=planet_name, value=value, inline=False)
-    
-    return embed
 
+    for item in data:
+        planet_name = "⚔️" + item['name']
+        value = f"Liberation: {item['liberation']}\nPlayers: {item['players']}\nInitial Owner: {item['initialOwner']}\nRegen per hour percent: {item['regen_per_hour_percent']}\nRegen per hour HP: {item['regen_per_hour_hp']}\nEstimated Outcome: {item.get('estimatedOutcome', 'N/A')}\nEstimated Time: {item.get('estimatedTime', 'N/A')}"
+        embed.add_field(name=planet_name, value=value, inline=False)
+
+    return embed
 
 
 
@@ -229,6 +222,7 @@ async def send_graph(ctx, planet: str, time_range: str):
 
     # Find the planet that most closely matches the selected planet
     closest_match = max(planets, key=lambda x: ratio(x.lower(), planet.lower()))
+    print(closest_match)
 
     # If the match is not close enough, reject the selection
     if ratio(closest_match.lower(), planet.lower()) < 0.8:
@@ -241,14 +235,14 @@ async def send_graph(ctx, planet: str, time_range: str):
             FROM historical_data
             WHERE planet = ? AND timestamp >= datetime('now', ?)
             ORDER BY timestamp DESC
-        ''', (planet, '-' + time_limit))
+        ''', (closest_match, '-' + time_limit))  # Use closest_match instead of planet
     else:
         cursor.execute('''
             SELECT timestamp, net_force
             FROM historical_data
-            WHERE planet = ?
+            WHERE planet = ? 
             ORDER BY timestamp DESC
-        ''', (planet,))
+        ''', (closest_match,))  # Use closest_match instead of planet
     rows = cursor.fetchall()
 
     if len(rows) < 2:
