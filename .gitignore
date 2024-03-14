@@ -2,3 +2,5 @@ servers.db
 .env
 map.png
 .gitignore
+gui.py
+helldivers_encrypt.py
