@@ -12,6 +12,8 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 import json
+from discord.errors import DiscordServerError
+import asyncio
 
 # Load environment variables from .env file
 load_dotenv()
@@ -48,6 +50,7 @@ def setup_db():
             net_force REAL NOT NULL
         )
     ''')
+    cursor.execute('CREATE TABLE IF NOT EXISTS announcement_channels (channel_id INTEGER PRIMARY KEY)')
     conn.commit()
     return conn
 
@@ -85,6 +88,51 @@ def add_server(conn, channel, message_id=None):
         # Insert a new record
         cursor.execute('INSERT INTO servers (channel) VALUES (?)', (channel,))
     conn.commit()
+def estimate_time_remaining(current_liberation, liberation_per_hour, regen_per_hour):
+    remaining_liberation = 100 - current_liberation
+    net_liberation_per_hour = liberation_per_hour - regen_per_hour
+    if net_liberation_per_hour <= 0:
+        return "Infinite"
+    else:
+        hours_remaining = remaining_liberation / net_liberation_per_hour
+        return f"{hours_remaining} hours remaining"
+from datetime import datetime
+
+def calculate_liberation_per_hour(conn, planet):
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT net_force, timestamp
+        FROM historical_data
+        WHERE planet = ?
+        ORDER BY timestamp DESC
+        LIMIT 2
+    ''', (planet,))
+    data = cursor.fetchall()
+    if len(data) < 2:
+        return None  # Not enough data to calculate liberation per hour
+    else:
+        recent_liberation, recent_timestamp_str = data[0]
+        previous_liberation, previous_timestamp_str = data[1]
+        # Convert timestamp strings to datetime objects
+        datetime_format = "%Y-%m-%d %H:%M:%S"  # Adjust this to match the format of your timestamps
+        recent_timestamp = datetime.strptime(recent_timestamp_str, datetime_format)
+        previous_timestamp = datetime.strptime(previous_timestamp_str, datetime_format)
+        liberation_diff = recent_liberation - previous_liberation
+        time_diff = (recent_timestamp - previous_timestamp).total_seconds() / 3600  # Convert time difference to hours
+        liberation_per_hour = liberation_diff / time_diff
+        return liberation_per_hour
+    
+async def cleanup_message_ids(channels_to_update):
+    cursor = conn.cursor()
+    for channel_id, message_id in channels_to_update:
+        channel = bot.get_channel(int(channel_id))
+        if channel is not None:
+            try:
+                await channel.fetch_message(message_id)
+            except discord.NotFound:
+                # If the message is not found, remove its ID from the database
+                cursor.execute("DELETE FROM servers WHERE channel_id = ?", (channel_id,))  # Assuming remove_message_id is a function that removes a message ID from the database
+
 
 
 
@@ -103,6 +151,11 @@ async def fetch_hell_divers_info():
     latest_data = requests.get('http://dev.nexusrealms.de:25567/api/planet-data').json()
     await bot.wait_until_ready()
     cleanup()
+    # Get the channels to update
+    channels_to_update = get_channels_to_update(conn)  # Pass the connection object
+
+    # Cleanup message IDs
+    await cleanup_message_ids(channels_to_update)
     for item in latest_data:
         if item['liberation'] is not None:
             global net_force_cleaned
@@ -114,7 +167,40 @@ async def fetch_hell_divers_info():
             conn.commit()
         else:
             print(f"Skipping insertion for planet {item['name']} due to missing 'liberation' value.")
+
+@tasks.loop(seconds=60)
+async def update_announcements():
+    await bot.wait_until_ready()
     
+    # Fetch the latest Hell Divers data
+    data = latest_data  # Use the data directly
+
+    # Get the announcement channels
+    cursor = conn.cursor()
+    cursor.execute('SELECT channel_id FROM announcement_channels')
+    announcement_channels = [row[0] for row in cursor.fetchall()]
+
+    # Get the list of planets from the database
+    cursor.execute('SELECT DISTINCT planet FROM historical_data')
+    db_planets = [row[0] for row in cursor.fetchall()]
+
+    # Get the list of planets from the latest data
+    latest_planets = [item['name'] for item in data]
+
+    # Find the planets that have been liberated
+    liberated_planets = [planet for planet in db_planets if planet not in latest_planets]
+
+    # Find the planets that are under attack
+    attacked_planets = [planet for planet in latest_planets if planet not in db_planets]
+
+    # Announce the status changes
+    for channel_id in announcement_channels:
+        channel = bot.get_channel(int(channel_id))
+        for planet in liberated_planets:
+            await channel.send(f'{planet} has been liberated!')
+        for planet in attacked_planets:
+            await channel.send(f'{planet} is under attack!')
+
 
 @tasks.loop(seconds=60)
 async def update_hell_divers_info():
@@ -129,39 +215,67 @@ async def update_hell_divers_info():
 
     for channel_id, message_id in channels_to_update:
         channel = bot.get_channel(int(channel_id))
+        if channel is None:
+            print(f"Channel with ID {channel_id} not found.")
+            continue  # Skip to the next iteration
         if message_id:
             # Edit the existing message
-            message = await channel.fetch_message(message_id)
+            for _ in range(3):  # retry up to 3 times
+                try:
+                    message = await channel.fetch_message(message_id)
+                    break  # if successful, break out of the loop
+                except DiscordServerError as e:
+                    if e.status == 503:
+                        await asyncio.sleep(10)  # wait for 10 seconds before retrying
+                    else:
+                        raise  # re-raise the exception if it's not a 503 error
             embed = create_embed(data)
             await message.edit(embed=embed)
         else:
             # Send a new message and store its ID
             embed = create_embed(data)
-            message = await channel.send(embed=embed)
+            try:
+                message = await channel.send(embed=embed)
+            except Exception as e:
+                print(f"Failed to send message to channel {channel_id}: {e}")
+                continue  # Skip to the next iteration
             # Store the new message ID for future updates
-            store_message_id(conn, channel_id, message.id)  # Pass the connection object
+            store_message_id(conn, channel_id, message.id)
 
 def store_message_id(conn, channel_id, message_id):
     cursor = conn.cursor()
     cursor.execute('UPDATE servers SET message_id = ? WHERE channel = ?', (message_id, channel_id))
     conn.commit()
-
 def create_embed(data):
     embed = discord.Embed(title="Galactic War Status", description="Current status of planets", color=0x00ff00)
     embed.timestamp = datetime.utcnow()
 
     for item in data:
+        value = ""
         planet_name = "⚔️" + item['name']
-        value = f"Liberation: {item['liberation']}\nPlayers: {item['players']}\nInitial Owner: {item['initialOwner']}\nRegen per hour percent: {item['regen_per_hour_percent']}\nRegen per hour HP: {item['regen_per_hour_hp']}\nEstimated Outcome: {item.get('estimatedOutcome', 'N/A')}\nEstimated Time: {item.get('estimatedTime', 'N/A')}"
+        liberation_percentage = round(float(item['liberation'].replace('%', '')))  # Remove the '%' and convert to float, then round to int
+        liberation_percentage = round(float(item['liberation'].replace('%', '')))  # Remove the '%' and convert to float, then round to int
+        liberation_per_hour = calculate_liberation_per_hour(conn, item['name'])
+        if liberation_per_hour is not None:
+            regen_per_hour = float(item['regen_per_hour_percent'].replace('%/hr', ''))
+            estimated_time = estimate_time_remaining(liberation_percentage, liberation_per_hour, regen_per_hour)
+            value += f"{estimated_time}"
+        if liberation_percentage < 50:
+            color = '🟥'  # red
+        elif 50 <= liberation_percentage < 75:
+            color = '🟧'  # orange
+        elif 75 <= liberation_percentage < 90:
+            color = '🟨'  # yellow
+        else:
+            color = '🟩'  # green
+        filled_length = round(liberation_percentage / 10)  # Calculate filled part of the bar
+        filled = color * filled_length
+        empty = '⬛' * (10 - filled_length)  # Calculate empty part of the bar
+        liberation = f"{filled}{empty} {liberation_percentage}%/100%"  # Add the percentage to the health bar
+        value = f"Liberation: {liberation}\nPlayers: {item['players']}\nInitial Owner: {item['initialOwner']}\nRegen per hour percent: {item['regen_per_hour_percent']}\nEstimated Time: {value}"#\nEstimated Outcome: {item.get('estimatedOutcome', 'N/A')}\nEstimated Time: {item.get('estimatedTime', 'N/A')}
         embed.add_field(name=planet_name, value=value, inline=False)
 
     return embed
-
-
-
-
-
-
 
 
 @bot.slash_command()
@@ -177,6 +291,7 @@ async def send_data(ctx):
 
 update_hell_divers_info.start()
 fetch_hell_divers_info.start()
+update_announcements.start()
 
 
 import matplotlib.dates as mdates
@@ -351,6 +466,42 @@ async def gen_map_wip(ctx):
 async def galactic_war_info(ctx: discord.ApplicationContext, channel: Union[discord.TextChannel]):
     add_server(conn, channel.id)
     await ctx.respond(f"Added Galactic War Status to channel {channel.mention}", ephemeral=True)
+@bot.slash_command()
+@option(
+    "channel",
+    Union[discord.TextChannel],
+    description="Select a channel",
+)
+async def remove_galactic_war_info(ctx: discord.ApplicationContext, channel: Union[discord.TextChannel]):
+    # Remove the channel ID from the database
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM servers WHERE channel_id = ?', (channel.id,))
+    conn.commit()
+    await ctx.respond(f"Removed Galactic War Status from channel {channel.mention}", ephemeral=True)
 
+@bot.slash_command()
+@option(
+    "channel",
+    Union[discord.TextChannel],
+    description="Select a channel",
+)
+async def set_announcement_channel(ctx: discord.ApplicationContext, channel: Union[discord.TextChannel]):
+    # Store the channel ID in the database
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO announcement_channels (channel_id) VALUES (?)', (channel.id,))
+    conn.commit()
+    await ctx.respond(f"Set {channel.mention} as the announcement channel", ephemeral=True)
+@bot.slash_command()
+@option(
+    "channel",
+    Union[discord.TextChannel],
+    description="Select a channel",
+)
+async def remove_announcement_channel(ctx: discord.ApplicationContext, channel: Union[discord.TextChannel]):
+    # Remove the channel ID from the database
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM announcement_channels WHERE channel_id = ?', (channel.id,))
+    conn.commit()
+    await ctx.respond(f"Removed {channel.mention} from the announcement channels", ephemeral=True)
 
 bot.run(os.getenv('DISCORD_BOT_TOKEN'))
